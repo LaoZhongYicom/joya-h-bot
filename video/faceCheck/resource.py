@@ -98,4 +98,9 @@ class Resource:
                     self._dropped += 1        # 上一帧没人取
                 self._seq += 1
                 self._frame = Frame(image, self._seq, now)
-                self.condition.
+                self.condition.notify_all()   # 必须在锁内
+
+        「丢帧」就是 self._frame = ... 这行：旧 Frame 引用归零立刻被回收，
+        没有 drop() 调用。notify_all 放锁外会丢唤醒。
+        """
+        raise NotImplementedError
