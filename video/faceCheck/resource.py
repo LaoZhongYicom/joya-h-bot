@@ -31,14 +31,20 @@ class Resource:
     # ---- 生命周期 ----
 
     def start(self) -> "Resource":
-        """TODO: 起 daemon 线程跑 _run，立刻返回。重复调用要幂等。"""
-        raise NotImplementedError
+        if self._thread is not None and self._thread.is_alive():
+            return self                      # 幂等
+        self._stopping.clear()               # 必须复位，否则重启无效
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
 
     def stop(self, timeout: float = 5.0) -> None:
-        """TODO: set 停止标志 -> notify_all 叫醒 read() -> join。
-
-        坑：不要在这里 release() self._capture。跨线程释放正在 read()
-        raise NotImplementedError
+        self._stopping.set()                 # 叫醒 event.wait()
+        with self.condition:
+            self.condition.notify_all()      # 叫醒 condition.wait()
+        # 不在这里 release capture：跨线程释放正在 read() 的对象会崩进程
+        if self._thread is not None:
+            self._thread.join(timeout)
 
     def __enter__(self):
         return self.start()
@@ -46,61 +52,70 @@ class Resource:
     def __exit__(self, *exc):
         self.stop()
 
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
     # ---- 消费 ----
 
     def read(self, timeout: float | None = None) -> Frame | None:
-        """ TODO: 阻塞到出现 seq > 进场时 seq 的帧，返回它；超时或停止返回 None。
-
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
-            start_seq = self._seq           # 先记下来
+            start_seq = self._seq             # 进场时的序号
             while True:
-                if self._seq > start_seq:   # 严格大于，同一帧不发两次
+                if self._seq > start_seq:     # 严格大于，同一帧不发两次
                     self._consumed_seq = self._seq
                     return self._frame
                 if self._stopping.is_set():
                     return None
-                # 按 timeout 调 wait()，超时 return None
-
-        必须记 start_seq，否则消费者会拿到旧帧反复处理。
-        wait() 会释放锁，生产者才进得来，别担心死锁。
-        """
-        raise NotImplementedError
+                if deadline is None:
+                    self.condition.wait()     # 会释放锁，生产者才进得来
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.condition.wait(remaining)
 
     # ---- 采集线程 ----
 
     def _run(self) -> None:
-        """TODO: 开连接 -> while 循环 read + publish -> finally 释放。
+        params = [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+        ]
+        capture = cv2.VideoCapture(self.path, cv2.CAP_FFMPEG, params)
+        if not capture.isOpened():
+            capture.release()
+            self._finish()
+            return
 
-            self._capture = cv2.VideoCapture(self.path, cv2.CAP_FFMPEG, params)
-            try:
-                while not self._stopping.is_set():
-                    ok, image = self._capture.read()
-                    if not ok:
-                        break
-                    self._publish(image)
-            finally:
-                self._capture.release()
-                self._capture = None
+        self._capture = capture
+        try:
+            while not self._stopping.is_set():
+                ok, image = capture.read()
+                if not ok:
+                    break                     # 流断了或文件读完了
+                self._publish(image)
+        finally:
+            self._capture = None
+            capture.release()
+            self._finish()
 
-        params 里放两个超时，否则死连接会挂住很久：
-            [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
-             cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000]
-        元素必须是 int，传 float 报 "Can't parse 'params'"。
-        """
-        raise NotImplementedError
+    def _finish(self) -> None:
+        """采集线程结束时叫醒所有阻塞的 read()，让它们返回 None。"""
+        self._stopping.set()
+        with self.condition:
+            self.condition.notify_all()
 
     def _publish(self, image) -> None:
-        """TODO: 锁内 6 行，全类的核心。
-
-            now = time.monotonic()
-            with self.condition:
-                if self._consumed_seq < self._seq:
-                    self._dropped += 1        # 上一帧没人取
-                self._seq += 1
-                self._frame = Frame(image, self._seq, now)
-                self.condition.notify_all()   # 必须在锁内
-
-        「丢帧」就是 self._frame = ... 这行：旧 Frame 引用归零立刻被回收，
-        没有 drop() 调用。notify_all 放锁外会丢唤醒。
-        """
-        raise NotImplementedError
+        now = time.monotonic()
+        with self.condition:
+            if self._consumed_seq < self._seq:
+                self._dropped += 1            # 上一帧没人取
+            self._seq += 1
+            self._frame = Frame(image, self._seq, now)   # 覆盖即丢弃
+            self.condition.notify_all()       # 必须在锁内
